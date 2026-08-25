@@ -228,7 +228,15 @@ func parseMailboxLog(t *testing.T, data []byte) []map[string]string {
 			t.Fatalf("incomplete record header at offset %d: %q", pos, rest)
 		}
 		fields := map[string]string{}
+		// rest[:i] ends with the "\n" that closes the last header-line
+		// (SPEC §5: header-line := field ":" SP value "\n"), so the split
+		// yields one trailing empty element that is NOT a header line —
+		// stop at the first blank element, and require every real line to
+		// be "field: value".
 		for _, line := range strings.Split(string(rest[:i]), "\n") {
+			if line == "" {
+				break
+			}
 			k, v, ok := strings.Cut(line, ": ")
 			if !ok {
 				t.Fatalf("malformed record header line %q", line)

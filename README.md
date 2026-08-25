@@ -17,6 +17,43 @@ message ids, deliveries, last-seen — lives in plain files under `bus_root`,
 so any number of bus processes (one per Crush session) can share a root, a
 killed process loses nothing, and a human can `cat` the whole system state.
 
+## Quickstart
+
+One command, no setup, no permanent changes — proves the full P3 loop
+(register → send → bus push → self-driven agent turn → reply →
+`wait_for_message`) on your machine:
+
+```sh
+./examples/quickstart.sh
+```
+
+What it does:
+
+- builds `.bin/mailbox-bus` and `.bin/crush-p3` (the P3 fork) if needed —
+  cached, skipped when up to date
+- creates a throwaway scratch dir under `$TMPDIR`: scratch `HOME`, data
+  dir, `bus_root`, socket. Your real `~/.local/share/crush/` config is
+  **copied, never modified**; the script adds the `mcp.bus` entry and
+  allowlists the 12 bus tools in the copy only
+- starts `crush server` (client-server mode), launches two agents —
+  `solo` (worker) and `orchestrator` — with your default model
+- verifies against the **durable bus logs** (the source of truth, SPEC
+  §13): prompt reached solo, reply from solo reached the orchestrator
+  with its dedup id, and the server log shows the push actually
+  self-drove solo's turn (`Starting agent turn from bus channel message`)
+
+Exits 0 only when every check passes, then removes the scratch dir.
+On failure it keeps the scratch dir and prints its path
+(`solo.out` / `orch.out` / `server.out` / `busroot/` hold the full trail).
+
+Optional: `QS_MODEL=provider/model ./examples/quickstart.sh` to run the
+demo on a specific model instead of your crush default.
+
+> Note: P3 requires the P3-enabled Crush fork in [`p3/crush`](p3/crush)
+> (branch `p3/mailbox-bus`) — the plain release build has no channel
+> routing. The script builds it for you; it assumes that tree is present
+> at `p3/crush` relative to the repo root.
+
 ## Status
 
 | Phase | Spec § | Contents | State |

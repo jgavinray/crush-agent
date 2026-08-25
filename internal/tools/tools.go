@@ -309,6 +309,32 @@ func Register(s *mcp.Server, b *bus.Bus) {
 		}
 		return map[string]any{"ok": true, "last_seen": lastSeen.UTC().Format(rfc3339)}, nil
 	}))
+
+	// --- P4 hardening tool (SPEC §17 P4) ----------------------------------
+
+	s.AddTool(&mcp.Tool{
+		Name: "compact",
+		Description: "Archive the consumed prefix of agent_id's mailbox: records with seq <= up_to_seq are appended " +
+			"verbatim to mailboxes/<agent_id>.log.archived and the live log is truncated to the remaining records " +
+			"(SPEC §16 Q4, §17 P4). Precondition: the agent has durably consumed up to up_to_seq (its last_seq_read). " +
+			"Per-recipient seq counters are unaffected — the next delivery continues from the last assigned seq. " +
+			"Idempotent: a boundary at or below the smallest live seq archives nothing. The cold archive is greppable " +
+			"and is the audit trail for compacted records (invariant V).",
+		InputSchema: objectSchema(map[string]any{
+			"agent_id":  map[string]any{"type": "string"},
+			"up_to_seq": map[string]any{"type": "integer", "minimum": 0},
+		}, "agent_id", "up_to_seq"),
+	}, handle(b, func(ctx context.Context, a map[string]any) (any, error) {
+		agentID, err := reqString(a, "agent_id")
+		if err != nil {
+			return nil, err
+		}
+		upToSeq, err := reqInt(a, "up_to_seq")
+		if err != nil {
+			return nil, err
+		}
+		return b.Compact(agentID, upToSeq)
+	}))
 }
 
 const rfc3339 = "2006-01-02T15:04:05Z07:00"

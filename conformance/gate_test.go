@@ -1094,3 +1094,129 @@ func TestC14_HeartbeatAndStatusErrors(t *testing.T) {
 		t.Fatalf("status lost across restart: %v", who)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P4 — hardening (SPEC §17 P4)
+// ---------------------------------------------------------------------------
+
+// C15 — compact: the consumed prefix is archived verbatim, the live log is
+// truncated in place, seq counters are unaffected, and it is idempotent
+// (SPEC §16 Q4, §17 P4).
+func TestC15_Compact(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+	p.register(t, "a", "sender")
+	p.register(t, "b", "receiver")
+
+	out1 := p.send(t, map[string]any{"agent_id": "a", "to_agent": "b", "kind": "prompt", "body": "msg 1"})
+	p.send(t, map[string]any{"agent_id": "a", "to_agent": "b", "kind": "prompt", "body": "msg 2"})
+	p.send(t, map[string]any{"agent_id": "a", "to_agent": "b", "kind": "info", "body": "msg 3"})
+
+	out := p.callObj(t, "compact", map[string]any{"agent_id": "b", "up_to_seq": 2})
+	if intField(t, out["archived"], "archived") != 2 {
+		t.Fatalf("compact = %v, want archived 2", out)
+	}
+
+	// Live log retains only seq 3, and parses to exactly one record.
+	live := readMailboxRecords(t, root, "b")
+	if len(live) != 1 || live[0]["seq"] != "3" || live[0]["body"] != "msg 3" {
+		t.Fatalf("live log after compact = %v, want single record seq 3", live)
+	}
+
+	// The cold archive holds the consumed prefix in order, verbatim.
+	archivedPath := filepath.Join(root, "mailboxes", "b.log.archived")
+	arch := parseMailboxLog(t, mustReadFile(t, archivedPath))
+	if len(arch) != 2 || arch[0]["seq"] != "1" || arch[1]["seq"] != "2" {
+		t.Fatalf("archive = %v, want records seq 1,2", arch)
+	}
+	if arch[0]["body"] != "msg 1" || arch[1]["body"] != "msg 2" {
+		t.Fatalf("archive bodies = %q, %q", arch[0]["body"], arch[1]["body"])
+	}
+
+	// seq counters are UNaffected by compact: the next delivery continues
+	// from seq 4 (SPEC §16 Q4).
+	out4 := p.send(t, map[string]any{"agent_id": "a", "to_agent": "b", "kind": "info", "body": "msg 4"})
+	assertDelivered(t, out4, 4, [2]any{"b", 4})
+
+	// Reads now return only the surviving records.
+	recs := p.callList(t, "read_my_mailbox", map[string]any{"agent_id": "b", "since": 2})
+	if len(recs) != 2 {
+		t.Fatalf("read_my_mailbox since=2 returned %d records, want 2 (seq 3,4)", len(recs))
+	}
+
+	// Idempotent: compacting the same boundary again archives nothing.
+	out2 := p.callObj(t, "compact", map[string]any{"agent_id": "b", "up_to_seq": 4})
+	if intField(t, out2["archived"], "archived") != 2 {
+		t.Fatalf("second compact = %v, want archived 2 (seq 3,4)", out2)
+	}
+	out3 := p.callObj(t, "compact", map[string]any{"agent_id": "b", "up_to_seq": 4})
+	if intField(t, out3["archived"], "archived") != 0 {
+		t.Fatalf("repeat compact = %v, want archived 0", out3)
+	}
+
+	// Errors: unknown agent, negative boundary.
+	p.callErr(t, "compact", map[string]any{"agent_id": "ghost", "up_to_seq": 0}, "agent_not_registered")
+	p.callErr(t, "compact", map[string]any{"agent_id": "b", "up_to_seq": -1}, "invalid_argument")
+
+	// A reply to a compacted-away record still resolves through the cold
+	// archive (SPEC §9 reply; §16 Q4).
+	id1 := intField(t, out1["id"], "id")
+	rep := p.callObj(t, "reply", map[string]any{"agent_id": "b", "in_reply_to": id1, "body": "done 1"})
+	assertDelivered(t, rep, 5, [2]any{"a", 1})
+}
+
+// C16 — dedup survives a process restart via the derived index: index.db
+// is rebuilt from the logs under the lock on every Open (SPEC §12, §17 P4,
+// §16 Q8), so a kill between two processes cannot make a dedup_id
+// "forget" its original.
+func TestC16_RestartDedupViaIndex(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+	p.register(t, "a", "ra")
+	p.register(t, "b", "rb")
+
+	orig := p.send(t, map[string]any{"agent_id": "a", "to_agent": "b", "kind": "info", "body": "k", "dedup_id": "K16"})
+	origID := intField(t, orig["id"], "id")
+
+	// P4: the derived index is on disk inside the root.
+	if fi, err := os.Stat(filepath.Join(root, "index.db")); err != nil {
+		t.Fatalf("index.db missing: %v", err)
+	} else if fi.Size() == 0 {
+		t.Fatalf("index.db is empty after a send")
+	}
+
+	// Kill the bus and restart: Open must rebuild index.db from the logs.
+	p.kill(t)
+	p2 := startBus(t, root)
+
+	again := p2.send(t, map[string]any{"agent_id": "a", "to_agent": "b", "kind": "info", "body": "k", "dedup_id": "K16"})
+	assertDelivered(t, again, origID, [2]any{"b", 1})
+	if n := countDedup(t, root, "K16"); n != 1 {
+		t.Fatalf("dedup_id K16 appears in %d records, want 1 (restart must not re-deliver)", n)
+	}
+}
+
+// C17 — bus_root is 0700 (SPEC §17 P4: file ownership on bus_root as the
+// shared-boundary gate; auth is moot over stdio, §14).
+func TestC17_RootPermissions(t *testing.T) {
+	// t.TempDir() is 0700 and would mask the check: use a 0755 root.
+	root, err := os.MkdirTemp("", "mbus-p4-root-*")
+	if err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatalf("chmod root 0755: %v", err)
+	}
+
+	p := startBus(t, root)
+	_ = p
+
+	fi, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("stat root: %v", err)
+	}
+	if perm := fi.Mode() & 0o777; perm != 0o700 {
+		t.Fatalf("bus_root mode = %o, want 700", perm)
+	}
+}

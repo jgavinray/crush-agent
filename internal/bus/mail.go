@@ -167,6 +167,9 @@ func (b *Bus) sendLocked(sender *Agent, toAgent, toRole, kind string, body []byt
 		if err := b.appendMailboxRecordLocked(r, rec.Encode()); err != nil {
 			return nil, err
 		}
+		if err := b.recordIndexLocked(&rec, r); err != nil {
+			return nil, err
+		}
 		delivered = append(delivered, Delivery{AgentID: r, Seq: seq})
 	}
 	return &SendResult{ID: id, Delivered: delivered}, nil
@@ -187,10 +190,11 @@ func (b *Bus) appendMailboxRecordLocked(agentID string, encoded []byte) error {
 	return b.syncFile(f)
 }
 
-// findDedupLocked scans all mailbox logs for a record carrying dedupID and
-// reconstructs the original send result (SPEC §7 step 0). Callers hold the
-// canonical-log lock.
-func (b *Bus) findDedupLocked(dedupID string) (*SendResult, bool, error) {
+// findDedupByLogScanLocked is the durable backstop for the §7 step-0 dedup
+// check: it scans all mailbox logs for a record carrying dedupID and
+// reconstructs the original send result. Callers hold the canonical-log
+// lock. The P4 index path (findDedupLocked, index.go) falls back to this.
+func (b *Bus) findDedupByLogScanLocked(dedupID string) (*SendResult, bool, error) {
 	byAgent, err := b.mailboxRecordsLocked()
 	if err != nil {
 		return nil, false, err
@@ -241,9 +245,10 @@ func (b *Bus) Reply(agentID string, inReplyTo int, body []byte, dedupID string) 
 				return nil
 			}
 		}
-		// v1 lookup (SPEC §9 "Lookup (v1)"): linear scan of the caller's
-		// own mailbox; on miss, in_reply_to_not_found.
-		origRec, found, err := b.mailboxRecordByID(agentID, inReplyTo)
+		// Lookup: the caller's own mailbox, falling back to the cold archive
+		// for records compacted away (SPEC §9 reply, §16 Q4); on miss,
+		// in_reply_to_not_found.
+		origRec, found, err := b.lookupRecordByID(agentID, inReplyTo)
 		if err != nil {
 			return err
 		}
@@ -263,12 +268,29 @@ func (b *Bus) Reply(agentID string, inReplyTo int, body []byte, dedupID string) 
 	return &res, nil
 }
 
-// mailboxRecordByID finds one complete record by global id in a mailbox log
-// (read-only; a partial trailing record is ignored, as on any mailbox read).
-func (b *Bus) mailboxRecordByID(agentID string, id int) (*Record, bool, error) {
-	recs, err := b.readMailboxRecords(agentID)
+// lookupRecordByID finds one complete record by global id: the live mailbox
+// log first, then the cold archive written by Compact (SPEC §16 Q4).
+// Read-only; a partial trailing record is ignored, as on any mailbox read.
+func (b *Bus) lookupRecordByID(agentID string, id int) (*Record, bool, error) {
+	if recs, err := b.readMailboxRecords(agentID); err != nil {
+		return nil, false, err
+	} else {
+		for i := range recs {
+			if recs[i].ID == id {
+				return &recs[i], true, nil
+			}
+		}
+	}
+	data, err := os.ReadFile(b.archivePath(agentID))
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, false, err
+	}
+	recs, _, _, perr := ParseRecords(data)
+	if perr != nil {
+		return nil, false, perr
 	}
 	for i := range recs {
 		if recs[i].ID == id {
@@ -390,8 +412,20 @@ func (b *Bus) WaitForMessage(agentID string, since int, fromRole, fromAgent, kin
 			return nil, ctx.Err()
 		default:
 		}
-		if rec, ok := b.matchMailbox(agentID, since, fromRole, fromAgent, kind); ok {
-			return rec, nil
+		// P4 fast path (SPEC §17 P4): when the index says no record with
+		// seq > since exists, skip the log parse in the common idle case.
+		// The index only covers (seq, from_agent); with a from_role or kind
+		// filter the authoritative log scan always runs.
+		skipScan := false
+		if fromRole == "" && kind == "" {
+			if has, known := b.waitIndexHasMatch(agentID, since, fromAgent); known && !has {
+				skipScan = true
+			}
+		}
+		if !skipScan {
+			if rec, ok := b.matchMailbox(agentID, since, fromRole, fromAgent, kind); ok {
+				return rec, nil
+			}
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {

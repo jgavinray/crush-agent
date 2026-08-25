@@ -24,12 +24,17 @@ func RootFromEnv() string {
 	return DefaultRootName
 }
 
-// Options configures Open. P1 runs with zeroed options (page-cache
-// durability, log-scan lookups); P4 enables both (SPEC §17 P4).
+// Options configures Open. The P1 reference mode is zeroed (page-cache
+// durability, log-scan lookups); P4 enables both fields (SPEC §17 P4).
 type Options struct {
 	// Fsync enables fsync-before-return on every canonical write, upgrading
 	// page-cache durability to power-loss durability (SPEC §3 IV, §17 P4).
 	Fsync bool
+	// Index maintains index.db, the derived lookup structure that makes
+	// dedup_id checks and the wait_for_message fast path O(1) (SPEC §16 Q4,
+	// §17 P4). The mailbox logs stay the source of truth; the index is
+	// rebuilt from them on every Open under the lock.
+	Index bool
 }
 
 // Bus is a stateless façade over the durable files under one root directory
@@ -38,8 +43,9 @@ type Options struct {
 // lock on state/lock (SPEC §7 "The canonical-log lock"). A Bus holds no
 // in-memory correctness state and may be killed at any time (SPEC §12).
 type Bus struct {
-	root string
-	opts Options
+	root  string
+	opts  Options
+	index *indexDB
 }
 
 // NewBus returns a Bus for root without touching the filesystem.
@@ -75,12 +81,27 @@ func (b *Bus) mailboxPath(id string) string {
 // partial trailing record left by a power loss.
 func Open(root string, opts Options) (*Bus, error) {
 	b := NewBus(root, opts)
-	for _, dir := range []string{b.root, b.stateDir(), b.registryDir(), b.mailboxesDir()} {
+	for _, dir := range []string{b.stateDir(), b.registryDir(), b.mailboxesDir()} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
+	// bus_root itself is 0700 (SPEC §17 P4: file ownership on bus_root as
+	// the shared-boundary gate; auth is moot over stdio, §14). Chmod as
+	// well as MkdirAll so pre-existing roots tighten on first P4 open.
+	if err := os.MkdirAll(b.root, 0o700); err != nil {
+		return nil, fmt.Errorf("create %s: %w", b.root, err)
+	}
+	if err := os.Chmod(b.root, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod %s: %w", b.root, err)
+	}
+	ix, err := b.openIndex()
+	if err != nil {
+		return nil, err
+	}
+	b.index = ix
 	if err := b.withLock(b.recover); err != nil {
+		b.Close()
 		return nil, err
 	}
 	return b, nil
@@ -94,7 +115,9 @@ func Open(root string, opts Options) (*Bus, error) {
 //  2. state/counter is recomputed as the max id observed across all mailbox
 //     logs, so neither a crash between the counter write and the record
 //     append, nor a hand-truncated or hand-edited log, can ever cause an id
-//     to be reused (SPEC §7 crash ordering, invariant II).
+//     to be reused (SPEC §7 crash ordering, invariant II);
+//  3. index.db is rebuilt from the (now-truncated) mailbox logs — the
+//     derived index can never lead the durable logs (SPEC §17 P4).
 func (b *Bus) recover() error {
 	for _, id := range b.listMailboxAgents() {
 		path := b.mailboxPath(id)
@@ -116,7 +139,10 @@ func (b *Bus) recover() error {
 	if err != nil {
 		return err
 	}
-	return b.writeCounterLocked(maxID)
+	if err := b.writeCounterLocked(maxID); err != nil {
+		return err
+	}
+	return b.rebuildIndexLocked()
 }
 
 // listMailboxAgents lists the agents that have a mailbox log.
@@ -223,6 +249,7 @@ func (b *Bus) writeIntCounter(path string, v int) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	preExisting := !b.fileAbsent(path)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -231,7 +258,29 @@ func (b *Bus) writeIntCounter(path string, v int) error {
 	if _, err := fmt.Fprintf(f, "%d\n", v); err != nil {
 		return err
 	}
-	return b.syncFile(f)
+	if err := b.syncFile(f); err != nil {
+		return err
+	}
+	// P4: durable-ify the directory entry when the file is brand new, so a
+	// power loss cannot leave the counter "lost" behind an unsynced dirent
+	// (SPEC §17 P4 fsync-before-return).
+	if !preExisting {
+		return b.syncDirFor(filepath.Dir(path))
+	}
+	return nil
+}
+
+// Close releases derived resources (the index.db handle). Safe to call more
+// than once and after a failed Open; it never touches durable state — the
+// bus holds no correctness state in memory (SPEC §2).
+func (b *Bus) Close() error {
+	if b.index != nil {
+		if err := b.index.db.Close(); err != nil {
+			return err
+		}
+		b.index = nil
+	}
+	return nil
 }
 
 // mailboxRecordsLocked parses every mailbox log (complete records only).

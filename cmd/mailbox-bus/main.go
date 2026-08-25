@@ -27,10 +27,12 @@ func main() {
 		root = *busRoot
 	}
 
-	// Open performs the SPEC §12 startup recovery under the lock: truncate
-	// partial trailing records, recompute state/counter from the logs, and
-	// rebuild the derived snapshots.
-	b, err := bus.Open(root, bus.Options{})
+	// P4 hardening (SPEC §17 P4): fsync-before-return on every canonical
+	// write (power-loss durability, invariant IV) and index.db for O(1)
+	// dedup checks and the wait_for_message fast path. The index is derived
+	// state — rebuilt from the logs under the lock on every Open — so these
+	// are safe defaults, not opt-ins.
+	b, err := bus.Open(root, bus.Options{Fsync: true, Index: true})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mailbox-bus: open bus root %s: %v\n", root, err)
 		os.Exit(1)
@@ -45,7 +47,14 @@ func main() {
 	// stdio transport: stdin/stdout are the MCP pipe owned by the spawning
 	// Crush session (SPEC §2). All diagnostics go to stderr.
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+		if cerr := b.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "mailbox-bus: close: %v\n", cerr)
+		}
 		fmt.Fprintf(os.Stderr, "mailbox-bus: server: %v\n", err)
+		os.Exit(1)
+	}
+	if err := b.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "mailbox-bus: close: %v\n", err)
 		os.Exit(1)
 	}
 }

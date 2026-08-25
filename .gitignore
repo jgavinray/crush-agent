@@ -1,0 +1,15 @@
+# Go build caches (kept inside the repo so builds work in sandboxed shells)
+.gocache/
+.gomodcache/
+
+# Test / build scratch
+.testtmp/
+bin/
+# anchored so it doesn't shadow the cmd/mailbox-bus/ source dir
+/mailbox-bus
+
+# Crush session state (per-user, not code)
+.crush/
+
+# OS noise
+.DS_Store

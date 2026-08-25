@@ -153,7 +153,7 @@ crash-idempotent: an empty root and a populated one start up the same way.
 go test ./conformance/ -v
 ```
 
-Cases C1–C17 (plus the P1 `wait_for_message` cross-process tests) cover the
+Cases C1–C18 (plus the P1 `wait_for_message` cross-process tests) cover the
 invariants: at-least-once delivery, cross-process dedup, per-pair ordering,
 crash-order gap-never-reuse, durable recipient expansion, idempotent
 consumer cursor, register/unregister/re-register, page-cache durability +

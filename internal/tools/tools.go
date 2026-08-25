@@ -223,6 +223,92 @@ func Register(s *mcp.Server, b *bus.Bus) {
 		dedup, _ := optString(a, "dedup_id")
 		return b.Reply(agentID, inReplyTo, []byte(body), dedup)
 	}))
+
+	// --- P2 lifecycle tools (SPEC §17 P2) ---------------------------------
+
+	s.AddTool(&mcp.Tool{
+		Name:        "whoami",
+		Description: "Return the durable registry state for agent_id (SPEC §9 whoami): identity, declared fields, current work-status, last_seen, registered_at. Read-only; no lock.",
+		InputSchema: objectSchema(map[string]any{
+			"agent_id": map[string]any{"type": "string"},
+		}, "agent_id"),
+	}, handle(b, func(ctx context.Context, a map[string]any) (any, error) {
+		agentID, err := reqString(a, "agent_id")
+		if err != nil {
+			return nil, err
+		}
+		ag, err := b.Whoami(agentID)
+		if err != nil {
+			return nil, err
+		}
+		return bus.Info(ag), nil
+	}))
+
+	s.AddTool(&mcp.Tool{
+		Name:        "get_agent",
+		Description: "Inspect any agent from any session (SPEC §9 get_agent): the whoami fields plus `recent`, the last 20 complete records of the agent's mailbox (id, seq, from, kind, ts, body_excerpt). Read-only; no lock.",
+		InputSchema: objectSchema(map[string]any{
+			"agent_id": map[string]any{"type": "string"},
+		}, "agent_id"),
+	}, handle(b, func(ctx context.Context, a map[string]any) (any, error) {
+		agentID, err := reqString(a, "agent_id")
+		if err != nil {
+			return nil, err
+		}
+		ag, err := b.Whoami(agentID)
+		if err != nil {
+			return nil, err
+		}
+		info, err := b.InfoWithRecent(ag, 20)
+		if err != nil {
+			return nil, err
+		}
+		return info, nil
+	}))
+
+	s.AddTool(&mcp.Tool{
+		Name: "set_my_status",
+		Description: "Publish a short free-form work-state string (\"idle\", \"working: auth module\", \"blocked: waiting on spec\", \"done\") " +
+			"(SPEC §9 set_my_status). Appends a status event to registry.log and updates the on-disk snapshot under the canonical-log lock. " +
+			"Status is reported verbatim by whoami/get_agent/list_agents and never used as a filter key.",
+		InputSchema: objectSchema(map[string]any{
+			"agent_id": map[string]any{"type": "string"},
+			"status":   map[string]any{"type": "string"},
+		}, "agent_id", "status"),
+	}, handle(b, func(ctx context.Context, a map[string]any) (any, error) {
+		agentID, err := reqString(a, "agent_id")
+		if err != nil {
+			return nil, err
+		}
+		status, err := reqString(a, "status")
+		if err != nil {
+			return nil, err
+		}
+		if err := b.SetStatus(agentID, status); err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true}, nil
+	}))
+
+	s.AddTool(&mcp.Tool{
+		Name: "heartbeat",
+		Description: "Keep-alive: refresh the agent's last_seen in the durable registry (SPEC §9 heartbeat). " +
+			"Observability only — no correctness property depends on it; it exists so list_agents can show which autonomous loops are still breathing (live = within 90s). " +
+			"Autonomous loop agents call it every ~30s.",
+		InputSchema: objectSchema(map[string]any{
+			"agent_id": map[string]any{"type": "string"},
+		}, "agent_id"),
+	}, handle(b, func(ctx context.Context, a map[string]any) (any, error) {
+		agentID, err := reqString(a, "agent_id")
+		if err != nil {
+			return nil, err
+		}
+		lastSeen, err := b.Heartbeat(agentID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "last_seen": lastSeen.UTC().Format(rfc3339)}, nil
+	}))
 }
 
 const rfc3339 = "2006-01-02T15:04:05Z07:00"
@@ -235,7 +321,7 @@ func handle(b *bus.Bus, fn func(ctx context.Context, a map[string]any) (any, err
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		a, err := parseArgs(req)
 		if err != nil {
-			return busErrorResult(fmt.Errorf("%s: %v", bus.CodeInvalidArgument, err)), nil
+			return busErrorResult(&bus.Error{Code: bus.CodeInvalidArgument, Message: err.Error()}), nil
 		}
 		out, err := fn(ctx, a)
 		if err != nil {

@@ -317,7 +317,7 @@ func (b *Bus) Register(agentID, role, description, workingDir, model string) (*A
 	}
 	var agent *Agent
 	err := b.withLock(func() error {
-		now := time.Now().UTC()
+		now := busNow()
 		agent = &Agent{
 			AgentID:      agentID,
 			Role:         sanitizeHeader(role),
@@ -357,7 +357,7 @@ func (b *Bus) Unregister(agentID string) (unregisteredAt time.Time, err error) {
 		return time.Time{}, err
 	}
 	err = b.withLock(func() error {
-		unregisteredAt = time.Now().UTC()
+		unregisteredAt = busNow()
 		if err := b.appendRegistryEventLocked(registryEvent{
 			kind:    eventUnregister,
 			agentID: agentID,
@@ -371,6 +371,172 @@ func (b *Bus) Unregister(agentID string) (unregisteredAt time.Time, err error) {
 		return time.Time{}, err
 	}
 	return unregisteredAt, nil
+}
+
+// SetStatus appends a status event and updates the snapshot under the lock
+// (SPEC §9 set_my_status). status is a short free-form work-state string;
+// it is reported verbatim and never used as a filter key.
+func (b *Bus) SetStatus(agentID, status string) error {
+	if err := validateAgentID(agentID); err != nil {
+		return err
+	}
+	if status == "" {
+		return errInvalidArgument("status must be a non-empty string")
+	}
+	status = sanitizeHeader(status)
+	return b.withLock(func() error {
+		if _, err := b.requireAgentLocked(agentID, true); err != nil {
+			return err
+		}
+		if err := b.appendRegistryEventLocked(registryEvent{
+			kind:    eventStatus,
+			agentID: agentID,
+			status:  status,
+			ts:      busNow(),
+		}); err != nil {
+			return err
+		}
+		return b.writeSnapshotLocked(b.statusSnapshotLocked(agentID, status))
+	})
+}
+
+// Heartbeat updates the agent's last_seen in the durable registry (SPEC §9
+// heartbeat). Observability only: no invariant depends on it.
+func (b *Bus) Heartbeat(agentID string) (lastSeen time.Time, err error) {
+	if err = validateAgentID(agentID); err != nil {
+		return time.Time{}, err
+	}
+	err = b.withLock(func() error {
+		if _, err := b.requireAgentLocked(agentID, true); err != nil {
+			return err
+		}
+		lastSeen = busNow()
+		if err := b.appendRegistryEventLocked(registryEvent{
+			kind:    eventHeartbeat,
+			agentID: agentID,
+			ts:      lastSeen,
+		}); err != nil {
+			return err
+		}
+		return b.writeSnapshotLocked(b.heartbeatSnapshotLocked(agentID, lastSeen))
+	})
+	if err != nil {
+		return time.Time{}, err
+	}
+	return lastSeen, nil
+}
+
+// statusSnapshotLocked / heartbeatSnapshotLocked return the current durable
+// registry state for agentID with the just-applied status / last_seen, so
+// the rewritten snapshot stays a faithful projection of registry.log.
+// Callers hold the lock.
+func (b *Bus) statusSnapshotLocked(agentID, status string) *Agent {
+	agents, _ := b.readRegistryLog()
+	a := agents[agentID]
+	a.Status = status
+	return a
+}
+
+func (b *Bus) heartbeatSnapshotLocked(agentID string, lastSeen time.Time) *Agent {
+	agents, _ := b.readRegistryLog()
+	a := agents[agentID]
+	a.LastSeen = lastSeen
+	return a
+}
+
+// AgentInfo is the whoami / get_agent payload (SPEC §9) plus, for
+// get_agent, the agent's most recent mailbox records.
+type AgentInfo struct {
+	AgentID      string         `json:"agent_id"`
+	Role         string         `json:"role"`
+	Description  string         `json:"description"`
+	WorkingDir   string         `json:"working_dir"`
+	Model        string         `json:"model"`
+	Status       string         `json:"status"`
+	LastSeen     string         `json:"last_seen"`
+	RegisteredAt string         `json:"registered_at"`
+	Recent       []RecentRecord `json:"recent,omitempty"`
+}
+
+// RecentRecord is one entry of get_agent's `recent` list (SPEC §9).
+type RecentRecord struct {
+	ID          int    `json:"id"`
+	Seq         int    `json:"seq"`
+	From        string `json:"from"`
+	Kind        string `json:"kind"`
+	TS          string `json:"ts"`
+	BodyExcerpt string `json:"body_excerpt"`
+}
+
+// recentExcerptBytes bounds body_excerpt (SPEC §9 names the field
+// body_excerpt; the bound is an implementation choice).
+const recentExcerptBytes = 200
+
+// Info renders the whoami payload for a live agent.
+func Info(a *Agent) AgentInfo {
+	return AgentInfo{
+		AgentID:      a.AgentID,
+		Role:         a.Role,
+		Description:  a.Description,
+		WorkingDir:   a.WorkingDir,
+		Model:        a.Model,
+		Status:       a.Status,
+		LastSeen:     a.LastSeen.UTC().Format(time.RFC3339),
+		RegisteredAt: a.RegisteredAt.UTC().Format(time.RFC3339),
+	}
+}
+
+// InfoWithRecent renders the get_agent payload: whoami fields plus the last
+// recentLimit complete records of the agent's mailbox, oldest first.
+func (b *Bus) InfoWithRecent(a *Agent, recentLimit int) (AgentInfo, error) {
+	info := Info(a)
+	if recentLimit > 0 {
+		recs, err := b.readMailboxRecords(a.AgentID)
+		if err != nil {
+			return info, err
+		}
+		start := len(recs) - recentLimit
+		if start < 0 {
+			start = 0
+		}
+		info.Recent = make([]RecentRecord, 0, len(recs)-start)
+		for i := start; i < len(recs); i++ {
+			r := &recs[i]
+			body := r.Body
+			if len(body) > recentExcerptBytes {
+				body = body[:recentExcerptBytes]
+			}
+			info.Recent = append(info.Recent, RecentRecord{
+				ID:          r.ID,
+				Seq:         r.Seq,
+				From:        r.From,
+				Kind:        r.Kind,
+				TS:          r.TS.UTC().Format(time.RFC3339),
+				BodyExcerpt: string(body),
+			})
+		}
+	}
+	return info, nil
+}
+
+// Whoami is the read-only whoami lookup (SPEC §9): the latest durable
+// registry state for agentID.
+func (b *Bus) Whoami(agentID string) (*Agent, error) {
+	if err := validateAgentID(agentID); err != nil {
+		return nil, err
+	}
+	agents, err := b.readRegistryLog()
+	if err != nil {
+		return nil, err
+	}
+	a, ok := agents[agentID]
+	if !ok {
+		return nil, errAgentNotRegistered(agentID)
+	}
+	if a.Membership != "alive" {
+		return nil, errAgentRemoved(agentID)
+	}
+	return a, nil
 }
 
 // ListAgents returns registry rows filtered by role, membership
@@ -449,6 +615,14 @@ func (b *Bus) GetAgent(agentID string) (*Agent, []Record, error) {
 		return nil, nil, err
 	}
 	return a, recs, nil
+}
+
+// busNow returns the current UTC time truncated to whole seconds: the
+// bus's own timestamps are second-granular (the spec examples are, and the
+// liveness window is 90s), and using one canonical representation keeps
+// registry.log, the snapshots, and tool results byte-identical.
+func busNow() time.Time {
+	return time.Now().UTC().Truncate(time.Second)
 }
 
 // sanitizeHeader forces a value to a single line so it stays inside one

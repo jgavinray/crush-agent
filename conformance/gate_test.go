@@ -896,3 +896,201 @@ func TestP1_WaitForMessageFilters(t *testing.T) {
 		t.Fatalf("expected timeout with since=3, got %v", out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P2 — lifecycle & inspection (SPEC §9, §10, §17 P2)
+// ---------------------------------------------------------------------------
+
+// C11 — Status and liveness: set_my_status is reported verbatim, heartbeat
+// refreshes the durable last_seen, and liveness derives from it (live within
+// the 90s window, dead beyond it).
+func TestC11_StatusAndLiveness(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+
+	p.register(t, "o", "orchestrator")
+	p.register(t, "w", "worker")
+
+	out := p.callObj(t, "set_my_status", map[string]any{
+		"agent_id": "w", "status": "working: auth module",
+	})
+	if out["ok"] != true {
+		t.Fatalf("set_my_status = %v, want {ok: true}", out)
+	}
+
+	agents := p.callList(t, "list_agents", map[string]any{})
+	var w, o map[string]any
+	for _, a := range agents {
+		switch a["agent_id"] {
+		case "w":
+			w = a
+		case "o":
+			o = a
+		}
+	}
+	if w == nil || o == nil {
+		t.Fatalf("list_agents missing agents: %v", agents)
+	}
+	if w["status"] != "working: auth module" {
+		t.Fatalf("status = %v, want \"working: auth module\"", w["status"])
+	}
+	if w["membership"] != "alive" {
+		t.Fatalf("membership = %v, want alive", w["membership"])
+	}
+	if w["liveness"] != "live" {
+		t.Fatalf("liveness = %v, want live (freshly registered)", w["liveness"])
+	}
+
+	hb := p.callObj(t, "heartbeat", map[string]any{"agent_id": "w"})
+	if hb["ok"] != true {
+		t.Fatalf("heartbeat = %v, want ok", hb)
+	}
+	ls, _ := hb["last_seen"].(string)
+	if ls == "" {
+		t.Fatalf("heartbeat missing last_seen: %v", hb)
+	}
+
+	// Durable: the on-disk snapshot projects the heartbeat (SPEC §6).
+	var snap map[string]any
+	snapData := mustReadFile(t, filepath.Join(root, "registry", "w.json"))
+	if err := json.Unmarshal(snapData, &snap); err != nil {
+		t.Fatalf("snapshot not JSON: %v", err)
+	}
+	if snap["last_seen"] != ls {
+		t.Fatalf("snapshot last_seen = %v, want %v", snap["last_seen"], ls)
+	}
+
+	who := p.callObj(t, "whoami", map[string]any{"agent_id": "w"})
+	if who["status"] != "working: auth module" || who["last_seen"] != ls {
+		t.Fatalf("whoami = %v, want status and last_seen %q", who, ls)
+	}
+
+	// Make w stale: append a heartbeat event with an old timestamp to the
+	// durable log (black-box state manipulation, as in C4). The running bus
+	// must observe it without a restart — membership reads are durable.
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	block := "event: heartbeat\nagent_id: w\nts: " + old + "\n\n"
+	f, err := os.OpenFile(filepath.Join(root, "registry.log"), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("append registry.log: %v", err)
+	}
+	if _, err := f.WriteString(block); err != nil {
+		t.Fatalf("write registry.log: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close registry.log: %v", err)
+	}
+
+	agents = p.callList(t, "list_agents", map[string]any{})
+	for _, a := range agents {
+		if a["agent_id"] == "w" && a["liveness"] != "dead" {
+			t.Fatalf("stale agent liveness = %v, want dead: %v", a["liveness"], a)
+		}
+	}
+	// The liveness filter must exclude the dead agent.
+	live := p.callList(t, "list_agents", map[string]any{"liveness": "live"})
+	for _, a := range live {
+		if a["agent_id"] == "w" {
+			t.Fatalf("liveness=live filter still lists dead agent w: %v", a)
+		}
+	}
+}
+
+// C12 — whoami: identity fields and error codes.
+func TestC12_WhoamiIdentityAndErrors(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+
+	p.register(t, "fe", "frontend")
+	out := p.callObj(t, "whoami", map[string]any{"agent_id": "fe"})
+	if out["agent_id"] != "fe" || out["role"] != "frontend" {
+		t.Fatalf("whoami identity wrong: %v", out)
+	}
+	if out["description"] != "gate agent fe" {
+		t.Fatalf("whoami description = %v, want \"gate agent fe\"", out["description"])
+	}
+	if out["working_dir"] != "/tmp/fe" {
+		t.Fatalf("whoami working_dir = %v, want /tmp/fe", out["working_dir"])
+	}
+	if out["registered_at"] == nil || out["registered_at"] == "" {
+		t.Fatalf("whoami missing registered_at: %v", out)
+	}
+
+	p.callErr(t, "whoami", map[string]any{"agent_id": "ghost"}, "agent_not_registered")
+
+	p.register(t, "gone", "g")
+	p.callObj(t, "unregister", map[string]any{"agent_id": "gone"})
+	p.callErr(t, "whoami", map[string]any{"agent_id": "gone"}, "agent_removed")
+}
+
+// C13 — get_agent: inspection from any session, recent records with
+// body_excerpt.
+func TestC13_GetAgent(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+	p.register(t, "s", "sender")
+	p.register(t, "r", "receiver")
+
+	body1 := strings.Repeat("x", 300)
+	out1 := p.send(t, map[string]any{"agent_id": "s", "to_agent": "r", "kind": "prompt", "body": body1})
+	p.send(t, map[string]any{"agent_id": "s", "to_agent": "r", "kind": "info", "body": "second"})
+
+	out := p.callObj(t, "get_agent", map[string]any{"agent_id": "r"})
+	if out["agent_id"] != "r" || out["role"] != "receiver" {
+		t.Fatalf("get_agent identity wrong: %v", out)
+	}
+	recent, ok := out["recent"].([]any)
+	if !ok || len(recent) != 2 {
+		t.Fatalf("get_agent recent = %v, want 2 records", out["recent"])
+	}
+	r0, r1 := recent[0].(map[string]any), recent[1].(map[string]any)
+	if intField(t, r0["id"], "recent.id") != intField(t, out1["id"], "id") {
+		t.Fatalf("recent[0].id = %v, want %v", r0["id"], out1["id"])
+	}
+	if r0["from"] != "s" || r0["kind"] != "prompt" {
+		t.Fatalf("recent[0] = %v", r0)
+	}
+	if r1["kind"] != "info" {
+		t.Fatalf("recent[1] = %v", r1)
+	}
+	if intField(t, r0["seq"], "recent.seq") != 1 {
+		t.Fatalf("recent[0].seq = %v, want 1", r0["seq"])
+	}
+	// body_excerpt must be a strict prefix of the 300-byte body.
+	ex, _ := r0["body_excerpt"].(string)
+	if !strings.HasPrefix(body1, ex) || len(ex) >= len(body1) {
+		t.Fatalf("body_excerpt = %q, want a strict prefix of the 300-byte body", ex)
+	}
+
+	p.callErr(t, "get_agent", map[string]any{"agent_id": "ghost"}, "agent_not_registered")
+}
+
+// C14 — heartbeat/set_my_status error codes, and status durability across a
+// process restart (SPEC §6 durable registry, §10 lifecycle).
+func TestC14_HeartbeatAndStatusErrors(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+	p.register(t, "h", "heartbeat-test")
+
+	first := p.callObj(t, "heartbeat", map[string]any{"agent_id": "h"})
+	if first["ok"] != true {
+		t.Fatalf("heartbeat = %v, want ok", first)
+	}
+	if ls, _ := first["last_seen"].(string); ls == "" {
+		t.Fatalf("heartbeat missing last_seen: %v", first)
+	}
+
+	p.callErr(t, "heartbeat", map[string]any{"agent_id": "ghost"}, "agent_not_registered")
+	p.callErr(t, "set_my_status", map[string]any{"agent_id": "ghost", "status": "idle"}, "agent_not_registered")
+	p.callErr(t, "set_my_status", map[string]any{"agent_id": "h", "status": ""}, "invalid_argument")
+
+	// Status must survive a process restart: it lives in registry.log, not
+	// in the process.
+	p.callObj(t, "set_my_status", map[string]any{"agent_id": "h", "status": "blocked: waiting on spec"})
+	p.kill(t)
+	p2 := startBus(t, root)
+	who := p2.callObj(t, "whoami", map[string]any{"agent_id": "h"})
+	if who["status"] != "blocked: waiting on spec" {
+		t.Fatalf("status lost across restart: %v", who)
+	}
+}

@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "bus": {
+      "type": "stdio",
+      "command": "/path/to/mailbox-bus",
+      "env": {
+        "BUS_ROOT": "$HOME/.crush-mailbox-bus"
+      }
+    }
+  }
+}

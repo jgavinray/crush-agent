@@ -135,7 +135,7 @@ func (b *Bus) sendLocked(sender *Agent, toAgent, toRole, kind string, body []byt
 	if dedupID != "" {
 		dedupPtr = &dedupID
 	}
-	now := time.Now().UTC()
+	now := busNow()
 	delivered := make([]Delivery, 0, len(recipients))
 	for _, r := range recipients {
 		seq, err := b.readSeqLocked(r)

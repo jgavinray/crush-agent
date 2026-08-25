@@ -24,7 +24,7 @@ killed process loses nothing, and a human can `cat` the whole system state.
 | P0 | §17 | Integration sanity: real Crush session drives the bus over stdio MCP | done |
 | P1 | §17 | Bus MVP: records, registry, delivery, wait, reply; gate C1–C10 | done |
 | P2 | §17 | Lifecycle + bootstrap: `whoami`, `get_agent`, `set_my_status`, `heartbeat`; prompts, examples; gate C11–C14 | done |
-| P3 | §17 | Delivery via `crush server` + channel | **out of scope** (separate Crush fork, spec §19.1) |
+| P3 | §17 | Delivery via `crush server` + channel, self-driving agent turn | done (Crush fork branch `p3/mailbox-bus`; bus-side gate C19–C20 here) |
 | P4 | §17 | Hardening: `index.db`, fsync-before-return, `compact`, 0700 root; gate C15–C17 | done |
 
 The conformance gate in [`conformance/`](conformance/) is the acceptance
@@ -153,13 +153,14 @@ crash-idempotent: an empty root and a populated one start up the same way.
 go test ./conformance/ -v
 ```
 
-Cases C1–C18 (plus the P1 `wait_for_message` cross-process tests) cover the
+Cases C1–C20 (plus the P1 `wait_for_message` cross-process tests) cover the
 invariants: at-least-once delivery, cross-process dedup, per-pair ordering,
 crash-order gap-never-reuse, durable recipient expansion, idempotent
 consumer cursor, register/unregister/re-register, page-cache durability +
 recovery, record framing, broadcast correlation, status/liveness,
 `whoami`/`get_agent` semantics, compact, restart dedup via the rebuilt
-index, and the 0700 root. The gate is black-box: it spawns the real binary
+index, the 0700 root, bootstrap layout, and P3 channel push (C19 single
+child, C20 cross-process scoping via the durable registry). The gate is black-box: it spawns the real binary
 over stdio MCP, kills it with SIGKILL, and reads the on-disk files as the
 oracle.
 

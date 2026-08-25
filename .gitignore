@@ -5,6 +5,7 @@
 # Test / build scratch
 .testtmp/
 bin/
+.bin/
 # anchored so it doesn't shadow the cmd/mailbox-bus/ source dir
 /mailbox-bus
 

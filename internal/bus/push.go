@@ -25,13 +25,20 @@ type ChannelSink interface {
 // from it — that is what turns "a message arrives" into "the agent
 // wakes up", replacing the §11.4 host-side loop wrapper.
 //
-// Why "agents this process has seen register": in the no-fork deployment
-// (N bus children, one per session) every child would otherwise re-push
-// every record for every agent to its own parent; scoping the push to
-// the agents observed through this process means each session is pushed
-// only its own mail. In the `crush server` deployment one bus child
-// serves all hosted sessions, so it observes every agent's register and
-// pushes for all of them — the server-side routing picks the owner.
+// Scoping (AgentSeen, bus.go): the pusher only pushes records for
+// registered agents — records are only valid for registered recipients,
+// and an unregistered agent's mailbox has no live session to wake.
+// AgentSeen is durable-registry-aware: it accepts an agent seen through
+// THIS bus process OR any sibling process sharing the root (the registry
+// snapshot under registry/ is shared by all bus children, SPEC
+// §4/§7/§9). That covers the `crush server` deployment, where each
+// workspace app spawns its own bus child: child B must push mail for
+// agent A even when A registered through child A's process. In a
+// multi-child deployment every child pushes every registered agent's
+// mail, so delivery is at-least-once per child — each Crush app routes a
+// push only to a session it owns (its own session store check), and the
+// pull path (read_my_mailbox / wait_for_message) with its seq cursor
+// deduplicates any replay.
 //
 // Delivery semantics: at-least-once, matching invariant I. A record is
 // pushed at most once per bus process lifetime (per-mailbox seq high

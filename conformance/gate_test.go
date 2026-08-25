@@ -1376,3 +1376,79 @@ func TestC19_ChannelPush(t *testing.T) {
 		t.Fatalf("content does not instruct the agent to pull the record: %q", content)
 	}
 }
+
+// TestC20_CrossProcessChannelPush verifies P3 push scoping across bus
+// processes that share one bus_root (SPEC §17 P3, §16 Q9): an agent that
+// registered through one bus child must still have its mail pushed by
+// another child that never saw its register. This is the `crush server`
+// topology (each workspace app spawns its own bus child, SPEC §4/§7):
+// AgentSeen (bus.go) falls back to the durable registry snapshot under
+// registry/, which every child on the root shares.
+func TestC20_CrossProcessChannelPush(t *testing.T) {
+	root := t.TempDir()
+
+	// proc1 registers "solo". By the time solo's mail lands, the process
+	// that saw the register may be gone (crush server: the first
+	// workspace's bus child dies with that workspace's app).
+	proc1 := startBus(t, root)
+	proc1.register(t, "solo", "worker")
+
+	// proc2 is a second bus child on the same root; it has never seen
+	// solo register and must still push solo's mail.
+	cmd := exec.Command(binPath)
+	cmd.Env = append(os.Environ(), "BUS_ROOT="+root)
+	errb := &bytes.Buffer{}
+	cmd.Stderr = errb
+
+	notifications := make(chan json.RawMessage, 16)
+	transport := &channelCapturingTransport{
+		Transport: &mcp.CommandTransport{Command: cmd},
+		ch:        notifications,
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "gate-c20", Version: "0"}, nil)
+	sess, err := client.Connect(context.Background(), transport, nil)
+	if err != nil {
+		t.Fatalf("bus connect (proc2): %v (stderr: %s)", err, errb.String())
+	}
+	t.Cleanup(func() {
+		_ = sess.Close()
+		_, _ = cmd.Process.Wait()
+	})
+
+	p2 := &busProc{t: t, cmd: cmd, sess: sess, root: root, errb: errb}
+	p2.register(t, "orchestrator", "orchestrator")
+	p2.send(t, map[string]any{
+		"agent_id": "orchestrator",
+		"to_agent": "solo",
+		"kind":     "prompt",
+		"body":     "C20: build the /login route and reply with the commit hash",
+	})
+
+	// Wait for the cross-process push (bus polls the mailbox every 250ms).
+	var params map[string]any
+	select {
+	case raw := <-notifications:
+		if err := json.Unmarshal(raw, &params); err != nil {
+			t.Fatalf("notification params unmarshal: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("no cross-process notifications/claude/channel within 10s of record delivery (proc2 stderr: %s)", errb.String())
+	}
+
+	meta, _ := params["meta"].(map[string]any)
+	if meta == nil {
+		t.Fatalf("notification has no meta object: %v", params)
+	}
+	if got := meta["agent_id"]; got != "solo" {
+		t.Fatalf("meta.agent_id = %v, want solo (cross-process routing key)", got)
+	}
+	if got := meta["from"]; got != "orchestrator" {
+		t.Fatalf("meta.from = %v, want orchestrator", got)
+	}
+	if got := meta["id"]; got != "1" {
+		t.Fatalf("meta.id = %v, want \"1\" (first record, fresh root)", got)
+	}
+	if content, _ := params["content"].(string); !strings.Contains(content, "C20: build the /login route") {
+		t.Fatalf("content does not carry the record body: %v", params)
+	}
+}

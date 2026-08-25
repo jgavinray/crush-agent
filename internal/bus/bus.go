@@ -49,12 +49,13 @@ type Bus struct {
 	index *indexDB
 
 	// seenAgents is the set of agent_ids that called register/whoami
-	// through THIS bus process. It scopes the P3 channel pusher: only
-	// mail for agents this process has seen is pushed to its own MCP
-	// client (see ChannelPusher, push.go). In-memory by design — the
-	// durable registry lives in registry.log; this is a per-process
-	// routing hint, and every agent re-registers on each session start
-	// (SPEC §11.1), so no state is lost across restarts.
+	// through THIS bus process. It is a fast-path cache for the P3
+	// channel pusher's scoping check (see AgentSeen, push.go): AgentSeen
+	// additionally falls back to the durable registry snapshot on disk,
+	// which is what makes the check correct across bus processes that
+	// share one root (each `crush server` workspace app spawns its own
+	// bus child; an agent registered through sibling child A must still
+	// be pushed when sibling child B observes mail for it).
 	seenMu     sync.Mutex
 	seenAgents map[string]struct{}
 }
@@ -79,14 +80,28 @@ func (b *Bus) NoteAgent(agentID string) {
 	b.seenAgents[agentID] = struct{}{}
 }
 
-// AgentSeen reports whether this bus process has seen agentID register or
-// call whoami. Used by the P3 channel pusher to scope pushes to the agents
-// this process serves (push.go).
+// AgentSeen reports whether agentID is a known registered agent: either
+// this bus process has observed its register/whoami call, or its durable
+// registry snapshot exists under registry/ (SPEC §9, §13). The registry
+// fallback is what makes the P3 channel push scope correct across bus
+// processes that share one root (SPEC §4, §7): in `crush server` mode
+// every workspace app spawns its own bus child, so a record for an agent
+// that registered through another child must still be pushed — the
+// owning session's router decides whether to act (push.go). Push
+// remains an at-least-once wake-up (invariant I); the pull path stays
+// the source of truth.
 func (b *Bus) AgentSeen(agentID string) bool {
+	if agentID == "" {
+		return false
+	}
 	b.seenMu.Lock()
-	defer b.seenMu.Unlock()
 	_, ok := b.seenAgents[agentID]
-	return ok
+	b.seenMu.Unlock()
+	if ok {
+		return true
+	}
+	_, err := os.Stat(b.snapshotPath(agentID))
+	return err == nil
 }
 
 // readMailboxFile reads a mailbox log; a missing mailbox yields no records.

@@ -118,7 +118,14 @@ func Open(root string, opts Options) (*Bus, error) {
 //     to be reused (SPEC §7 crash ordering, invariant II);
 //  3. index.db is rebuilt from the (now-truncated) mailbox logs — the
 //     derived index can never lead the durable logs (SPEC §17 P4).
+//
+// It also guarantees the SPEC §13 bootstrap layout: registry.log exists
+// from the first start (created empty), so the canonical log is a stable
+// path a human or host-side verifier can always `cat`.
 func (b *Bus) recover() error {
+	if err := b.ensureRegistryLogLocked(); err != nil {
+		return err
+	}
 	for _, id := range b.listMailboxAgents() {
 		path := b.mailboxPath(id)
 		data, err := os.ReadFile(path)
@@ -143,6 +150,16 @@ func (b *Bus) recover() error {
 		return err
 	}
 	return b.rebuildIndexLocked()
+}
+
+// ensureRegistryLogLocked creates registry.log if absent (SPEC §13: on
+// start the bus creates it "if absent"). Callers hold the lock.
+func (b *Bus) ensureRegistryLogLocked() error {
+	f, err := os.OpenFile(b.registryLogPath(), os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("create registry.log: %w", err)
+	}
+	return f.Close()
 }
 
 // listMailboxAgents lists the agents that have a mailbox log.

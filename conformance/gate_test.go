@@ -1220,3 +1220,29 @@ func TestC17_RootPermissions(t *testing.T) {
 		t.Fatalf("bus_root mode = %o, want 700", perm)
 	}
 }
+
+// C18 — Bootstrap layout (SPEC §13 self-containment): starting on an empty
+// bus_root creates state/, registry/, mailboxes/, registry.log, and
+// state/counter (value 0); the root is 0700.
+func TestC18_BootstrapLayout(t *testing.T) {
+	root := t.TempDir()
+	p := startBus(t, root)
+
+	for _, rel := range []string{
+		"state", "state/counter", "state/lock",
+		"registry", "registry.log", "mailboxes",
+	} {
+		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+			t.Fatalf("missing %q after Open: %v", rel, err)
+		}
+	}
+	if got := readCounter(t, root); got != 0 {
+		t.Fatalf("initial counter = %d, want 0", got)
+	}
+	if fi, err := os.Stat(root); err != nil {
+		t.Fatalf("stat root: %v", err)
+	} else if perm := fi.Mode() & 0o777; perm != 0o700 {
+		t.Fatalf("bus_root mode = %o, want 700", perm)
+	}
+	_ = p
+}

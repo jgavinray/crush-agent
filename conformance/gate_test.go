@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -1245,4 +1246,133 @@ func TestC18_BootstrapLayout(t *testing.T) {
 		t.Fatalf("bus_root mode = %o, want 700", perm)
 	}
 	_ = p
+}
+
+// --- P3 channel push (SPEC §17 P3, §16 Q9) ------------------------------
+//
+// channelCapturingTransport is the test-side twin of Crush's
+// channelTransport: it intercepts notifications/claude/channel frames at
+// the transport layer and exposes them, so the gate can assert the bus
+// actually pushes on the wire (the go-sdk client otherwise drops unknown
+// notifications).
+
+type channelCapturingTransport struct {
+	mcp.Transport
+	ch chan json.RawMessage
+}
+
+func (t *channelCapturingTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	c, err := t.Transport.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &channelCapturingConn{Connection: c, ch: t.ch}, nil
+}
+
+type channelCapturingConn struct {
+	mcp.Connection
+	ch chan json.RawMessage
+}
+
+func (c *channelCapturingConn) Read(ctx context.Context) (jsonrpc.Message, error) {
+	for {
+		msg, err := c.Connection.Read(ctx)
+		if err != nil {
+			return msg, err
+		}
+		if req, ok := msg.(*jsonrpc.Request); ok && req.Method == "notifications/claude/channel" {
+			select {
+			case c.ch <- req.Params:
+			default:
+			}
+			continue
+		}
+		return msg, nil
+	}
+}
+
+// TestC19_ChannelPush verifies the bus half of P3 (SPEC §17 P3, §16 Q9):
+// the server declares the claude/channel experimental capability, and every
+// new mailbox record belonging to an agent this bus process has seen
+// register is pushed as a notifications/claude/channel notification with
+// machine-readable routing meta. The Crush P3 fork consumes that
+// notification and self-drives a turn on the owning session; the gate
+// asserts the wire side.
+func TestC19_ChannelPush(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command(binPath)
+	cmd.Env = append(os.Environ(), "BUS_ROOT="+root)
+	errb := &bytes.Buffer{}
+	cmd.Stderr = errb
+
+	notifications := make(chan json.RawMessage, 16)
+	transport := &channelCapturingTransport{
+		Transport: &mcp.CommandTransport{Command: cmd},
+		ch:        notifications,
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "gate-c19", Version: "0"}, nil)
+	sess, err := client.Connect(context.Background(), transport, nil)
+	if err != nil {
+		t.Fatalf("bus connect: %v (stderr: %s)", err, errb.String())
+	}
+	t.Cleanup(func() {
+		_ = sess.Close()
+		_, _ = cmd.Process.Wait()
+	})
+
+	// The capability must be advertised in the initialize result.
+	initRes := sess.InitializeResult()
+	if initRes == nil || initRes.Capabilities == nil || initRes.Capabilities.Experimental == nil {
+		t.Fatalf("initialize result: capabilities.experimental missing (P3 requires claude/channel to be declared)")
+	}
+	if _, ok := initRes.Capabilities.Experimental["claude/channel"]; !ok {
+		t.Fatalf("initialize result: capabilities.experimental[claude/channel] missing; got %v", initRes.Capabilities.Experimental)
+	}
+
+	// Register both agents THROUGH this bus process (this is what makes the
+	// pusher push their mail), then deliver a record to agent "b".
+	p := &busProc{t: t, cmd: cmd, sess: sess, root: root, errb: errb}
+	p.register(t, "a", "orchestrator")
+	p.register(t, "b", "worker")
+	p.send(t, map[string]any{
+		"agent_id": "a",
+		"to_agent": "b",
+		"kind":     "prompt",
+		"body":     "C19: build the /login route and reply with the commit hash",
+	})
+
+	// Wait for the push (bus polls the mailbox every 250ms).
+	var params map[string]any
+	select {
+	case raw := <-notifications:
+		if err := json.Unmarshal(raw, &params); err != nil {
+			t.Fatalf("notification params unmarshal: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("no notifications/claude/channel within 10s of record delivery (bus stderr: %s)", errb.String())
+	}
+
+	meta, _ := params["meta"].(map[string]any)
+	if meta == nil {
+		t.Fatalf("notification has no meta object: %v", params)
+	}
+	if got := meta["agent_id"]; got != "b" {
+		t.Fatalf("meta.agent_id = %v, want b (routing key)", got)
+	}
+	if got := meta["kind"]; got != "prompt" {
+		t.Fatalf("meta.kind = %v, want prompt", got)
+	}
+	if got := meta["from"]; got != "a" {
+		t.Fatalf("meta.from = %v, want a", got)
+	}
+	if got := meta["id"]; got != "1" {
+		t.Fatalf("meta.id = %v, want \"1\" (first record, fresh root)", got)
+	}
+	content, _ := params["content"].(string)
+	if !strings.Contains(content, "C19: build the /login route") {
+		t.Fatalf("content does not carry the record body: %q", content)
+	}
+	if !strings.Contains(content, "read_my_mailbox") {
+		t.Fatalf("content does not instruct the agent to pull the record: %q", content)
+	}
 }

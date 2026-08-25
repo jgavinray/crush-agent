@@ -44,6 +44,9 @@ func Register(s *mcp.Server, b *bus.Bus) {
 		if err != nil {
 			return nil, err
 		}
+		// P3 (SPEC §17 P3): this process is now known to serve agentID, so
+		// the channel pusher may push agentID's mail to this client.
+		b.NoteAgent(agentID)
 		return map[string]any{
 			"agent_id":      ag.AgentID,
 			"role":          ag.Role,
@@ -241,6 +244,8 @@ func Register(s *mcp.Server, b *bus.Bus) {
 		if err != nil {
 			return nil, err
 		}
+		// P3: whoami confirms this session serves agentID as well.
+		b.NoteAgent(agentID)
 		return bus.Info(ag), nil
 	}))
 

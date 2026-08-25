@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // DefaultRootName is where the bus root lives when BUS_ROOT is unset
@@ -46,11 +47,73 @@ type Bus struct {
 	root  string
 	opts  Options
 	index *indexDB
+
+	// seenAgents is the set of agent_ids that called register/whoami
+	// through THIS bus process. It scopes the P3 channel pusher: only
+	// mail for agents this process has seen is pushed to its own MCP
+	// client (see ChannelPusher, push.go). In-memory by design — the
+	// durable registry lives in registry.log; this is a per-process
+	// routing hint, and every agent re-registers on each session start
+	// (SPEC §11.1), so no state is lost across restarts.
+	seenMu     sync.Mutex
+	seenAgents map[string]struct{}
 }
 
 // NewBus returns a Bus for root without touching the filesystem.
 func NewBus(root string, opts Options) *Bus {
 	return &Bus{root: filepath.Clean(root), opts: opts}
+}
+
+// NoteAgent records that agentID interacted with this bus process
+// (SPEC §17 P3 channel push scoping). Called by the tool layer on
+// register/whoami.
+func (b *Bus) NoteAgent(agentID string) {
+	if agentID == "" {
+		return
+	}
+	b.seenMu.Lock()
+	defer b.seenMu.Unlock()
+	if b.seenAgents == nil {
+		b.seenAgents = make(map[string]struct{})
+	}
+	b.seenAgents[agentID] = struct{}{}
+}
+
+// AgentSeen reports whether this bus process has seen agentID register or
+// call whoami. Used by the P3 channel pusher to scope pushes to the agents
+// this process serves (push.go).
+func (b *Bus) AgentSeen(agentID string) bool {
+	b.seenMu.Lock()
+	defer b.seenMu.Unlock()
+	_, ok := b.seenAgents[agentID]
+	return ok
+}
+
+// readMailboxFile reads a mailbox log; a missing mailbox yields no records.
+func (b *Bus) readMailboxFile(agentID string) ([]byte, error) {
+	data, err := os.ReadFile(b.mailboxPath(agentID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// MaxSeq returns the highest seq in the agent's mailbox log (the last
+// record's seq; logs are append-only with monotonic per-recipient seq,
+// SPEC §5/§7). ok=false when the mailbox has no complete records.
+func (b *Bus) MaxSeq(agentID string) (int, bool) {
+	data, err := b.readMailboxFile(agentID)
+	if err != nil || len(data) == 0 {
+		return 0, false
+	}
+	recs, _, _, perr := ParseRecords(data)
+	if perr != nil || len(recs) == 0 {
+		return 0, false
+	}
+	return recs[len(recs)-1].Seq, true
 }
 
 // Root returns the bus root directory.
